@@ -2,6 +2,12 @@
 
 Near-real-time monitoring for newly registered, Microsoft Entra joined, or hybrid joined devices without waiting for Microsoft Sentinel log ingestion.
 
+## Logic App implementation
+
+The [Logic App package](logic-app/README.md) includes Code View JSON, an ARM deployment template, and setup instructions. It polls Graph every minute using managed identity and writes new-device detections to Blob Storage. The template creates the app disabled; configure storage and permissions before enabling it. Owner enrichment and Sentinel alert integration can be added later.
+
+The initial run establishes a baseline without alerts. The package has passed structural checks but has not been deployed or tested against a tenant. Detection latency and costs depend on actual Graph propagation, workflow runs, and action counts.
+
 ## Recommended approach
 
 Use a **Consumption Logic App** that runs every minute and polls the Microsoft Graph device delta endpoint:

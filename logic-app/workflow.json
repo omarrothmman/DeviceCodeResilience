@@ -1,0 +1,464 @@
+{
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "storageAccountName": {
+        "type": "String",
+        "defaultValue": "REPLACE_WITH_STORAGE_ACCOUNT"
+      },
+      "stateContainer": {
+        "type": "String",
+        "defaultValue": "device-state"
+      },
+      "detectionsContainer": {
+        "type": "String",
+        "defaultValue": "device-detections"
+      }
+    },
+    "triggers": {
+      "Every_minute": {
+        "type": "Recurrence",
+        "recurrence": {
+          "frequency": "Minute",
+          "interval": 1
+        },
+        "runtimeConfiguration": {
+          "concurrency": {
+            "runs": 1
+          }
+        }
+      }
+    },
+    "actions": {
+      "Read_checkpoint": {
+        "type": "Http",
+        "inputs": {
+          "uri": "@concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('stateContainer'), '/checkpoint.json')",
+          "method": "GET",
+          "headers": {
+            "x-ms-version": "2023-11-03"
+          },
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://storage.azure.com/"
+          },
+          "retryPolicy": {
+            "type": "Exponential",
+            "count": 4,
+            "interval": "PT10S"
+          }
+        },
+        "runAfter": {}
+      },
+      "Validate_checkpoint": {
+        "type": "ParseJson",
+        "inputs": {
+          "content": "@body('Read_checkpoint')",
+          "schema": {
+            "type": "object",
+            "required": [
+              "schemaVersion",
+              "deltaLink",
+              "knownDeviceIds"
+            ],
+            "properties": {
+              "schemaVersion": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "deltaLink": {
+                "type": "string"
+              },
+              "knownDeviceIds": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "runAfter": {
+          "Read_checkpoint": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Process_all_pages": {
+        "type": "Until",
+        "expression": "@or(empty(variables('nextLink')), variables('processingFailed'))",
+        "limit": {
+          "count": 5000,
+          "timeout": "PT1H"
+        },
+        "operationOptions": "FailWhenLimitsReached",
+        "actions": {
+          "Process_page": {
+            "type": "Scope",
+            "actions": {
+              "Get_device_delta": {
+                "type": "Http",
+                "inputs": {
+                  "uri": "@variables('nextLink')",
+                  "method": "GET",
+                  "headers": {
+                    "Accept": "application/json"
+                  },
+                  "authentication": {
+                    "type": "ManagedServiceIdentity",
+                    "audience": "https://graph.microsoft.com"
+                  },
+                  "retryPolicy": {
+                    "type": "Exponential",
+                    "count": 4,
+                    "interval": "PT10S"
+                  }
+                },
+                "runAfter": {}
+              },
+              "Validate_page": {
+                "type": "ParseJson",
+                "inputs": {
+                  "content": "@body('Get_device_delta')",
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "value"
+                    ],
+                    "properties": {
+                      "value": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "id"
+                          ],
+                          "properties": {
+                            "id": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "runAfter": {
+                  "Get_device_delta": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "For_each_device": {
+                "type": "Foreach",
+                "foreach": "@body('Validate_page')?['value']",
+                "runtimeConfiguration": {
+                  "concurrency": {
+                    "repetitions": 1
+                  }
+                },
+                "actions": {
+                  "If_unseen_device": {
+                    "type": "If",
+                    "expression": "@and(not(variables('processingFailed')), not(contains(items('For_each_device'), '@removed')), not(contains(variables('knownDeviceIds'), items('For_each_device')?['id'])))",
+                    "actions": {
+                      "If_live_monitoring": {
+                        "type": "If",
+                        "expression": "@not(variables('baseline'))",
+                        "actions": {
+                          "Write_detection": {
+                            "type": "Http",
+                            "inputs": {
+                              "uri": "@concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('detectionsContainer'), '/', items('For_each_device')?['id'], '.json')",
+                              "method": "PUT",
+                              "headers": {
+                                "x-ms-version": "2023-11-03",
+                                "x-ms-blob-type": "BlockBlob",
+                                "Content-Type": "application/json",
+                                "If-None-Match": "*"
+                              },
+                              "authentication": {
+                                "type": "ManagedServiceIdentity",
+                                "audience": "https://storage.azure.com/"
+                              },
+                              "body": {
+                                "schemaVersion": 1,
+                                "eventType": "EntraDeviceFirstObserved",
+                                "eventId": "@items('For_each_device')?['id']",
+                                "detectedAtUtc": "@utcNow()",
+                                "device": "@items('For_each_device')"
+                              },
+                              "retryPolicy": {
+                                "type": "Exponential",
+                                "count": 4,
+                                "interval": "PT10S"
+                              }
+                            },
+                            "runAfter": {}
+                          },
+                          "Check_detection_result": {
+                            "type": "If",
+                            "expression": "@or(equals(outputs('Write_detection')?['statusCode'], 201), equals(outputs('Write_detection')?['statusCode'], 412))",
+                            "actions": {
+                              "Detection_saved": {
+                                "type": "Compose",
+                                "inputs": "Detection persisted or already exists.",
+                                "runAfter": {}
+                              }
+                            },
+                            "else": {
+                              "actions": {
+                                "Mark_detection_failure": {
+                                  "type": "SetVariable",
+                                  "inputs": {
+                                    "name": "processingFailed",
+                                    "value": true
+                                  },
+                                  "runAfter": {}
+                                }
+                              }
+                            },
+                            "runAfter": {
+                              "Write_detection": [
+                                "Succeeded",
+                                "Failed",
+                                "TimedOut"
+                              ]
+                            }
+                          }
+                        },
+                        "else": {
+                          "actions": {}
+                        },
+                        "runAfter": {}
+                      },
+                      "Remember_after_success": {
+                        "type": "If",
+                        "expression": "@not(variables('processingFailed'))",
+                        "actions": {
+                          "Remember_device": {
+                            "type": "AppendToArrayVariable",
+                            "inputs": {
+                              "name": "knownDeviceIds",
+                              "value": "@items('For_each_device')?['id']"
+                            },
+                            "runAfter": {}
+                          }
+                        },
+                        "else": {
+                          "actions": {}
+                        },
+                        "runAfter": {
+                          "If_live_monitoring": [
+                            "Succeeded"
+                          ]
+                        }
+                      }
+                    },
+                    "else": {
+                      "actions": {}
+                    },
+                    "runAfter": {}
+                  }
+                },
+                "runAfter": {
+                  "Validate_page": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "Set_next_link": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "nextLink",
+                  "value": "@coalesce(body('Get_device_delta')?['@odata.nextLink'], '')"
+                },
+                "runAfter": {
+                  "For_each_device": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "Set_delta_link": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "deltaLink",
+                  "value": "@coalesce(body('Get_device_delta')?['@odata.deltaLink'], '')"
+                },
+                "runAfter": {
+                  "Set_next_link": [
+                    "Succeeded"
+                  ]
+                }
+              }
+            },
+            "runAfter": {}
+          },
+          "Stop_on_page_failure": {
+            "type": "SetVariable",
+            "inputs": {
+              "name": "processingFailed",
+              "value": true
+            },
+            "runAfter": {
+              "Process_page": [
+                "Failed",
+                "TimedOut"
+              ]
+            }
+          }
+        },
+        "runAfter": {
+          "Initialize_processingFailed": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Commit_only_complete_round": {
+        "type": "If",
+        "expression": "@and(not(variables('processingFailed')), empty(variables('nextLink')), not(empty(variables('deltaLink'))))",
+        "actions": {
+          "Save_checkpoint": {
+            "type": "Http",
+            "inputs": {
+              "uri": "@concat('https://', parameters('storageAccountName'), '.blob.core.windows.net/', parameters('stateContainer'), '/checkpoint.json')",
+              "method": "PUT",
+              "headers": {
+                "x-ms-version": "2023-11-03",
+                "x-ms-blob-type": "BlockBlob",
+                "Content-Type": "application/json",
+                "If-Match": "@coalesce(outputs('Read_checkpoint')?['headers']?['ETag'], outputs('Read_checkpoint')?['headers']?['Etag'], outputs('Read_checkpoint')?['headers']?['etag'], 'missing-etag')"
+              },
+              "authentication": {
+                "type": "ManagedServiceIdentity",
+                "audience": "https://storage.azure.com/"
+              },
+              "body": {
+                "schemaVersion": 1,
+                "deltaLink": "@variables('deltaLink')",
+                "knownDeviceIds": "@variables('knownDeviceIds')"
+              },
+              "retryPolicy": {
+                "type": "Exponential",
+                "count": 4,
+                "interval": "PT10S"
+              }
+            },
+            "runAfter": {}
+          }
+        },
+        "else": {
+          "actions": {
+            "Fail_without_checkpoint": {
+              "type": "Terminate",
+              "inputs": {
+                "runStatus": "Failed",
+                "runError": {
+                  "code": "IncompleteDeltaRound",
+                  "message": "Processing failed or Graph did not return a final deltaLink. Checkpoint was not advanced. Inspect action history before retrying."
+                }
+              },
+              "runAfter": {}
+            }
+          }
+        },
+        "runAfter": {
+          "Process_all_pages": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_knownDeviceIds": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "knownDeviceIds",
+              "type": "Array",
+              "value": "@body('Validate_checkpoint')?['knownDeviceIds']"
+            }
+          ]
+        },
+        "runAfter": {
+          "Validate_checkpoint": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_baseline": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "baseline",
+              "type": "Boolean",
+              "value": "@empty(body('Validate_checkpoint')?['deltaLink'])"
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_knownDeviceIds": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_nextLink": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "nextLink",
+              "type": "String",
+              "value": "@if(empty(body('Validate_checkpoint')?['deltaLink']), 'https://graph.microsoft.com/v1.0/devices/delta?$select=id,deviceId,displayName,trustType,operatingSystem,operatingSystemVersion,registrationDateTime,accountEnabled', body('Validate_checkpoint')?['deltaLink'])"
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_baseline": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_deltaLink": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "deltaLink",
+              "type": "String",
+              "value": ""
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_nextLink": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_processingFailed": {
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "processingFailed",
+              "type": "Boolean",
+              "value": false
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_deltaLink": [
+            "Succeeded"
+          ]
+        }
+      }
+    },
+    "outputs": {}
+  },
+  "parameters": {}
+}
